@@ -8,7 +8,6 @@ DOMAIN="au-team.irpo"
 PASS="P@ssw0rd"
 TIMEZONE="Europe/Moscow"
 
-# Set Timezone
 timedatectl set-timezone "$TIMEZONE" 2>/dev/null || true
 
 echo "========================================="
@@ -29,27 +28,26 @@ case $ROLE in
         echo "[+] Configuring ISP..."
         hostnamectl set-hostname isp
         
-        # ISP interfaces: ens1 (to HQ), ens2 (to BR)
-        mkdir -p /etc/net/ifaces/ens1 /etc/net/ifaces/ens2
-
-        cat << 'EOF' > /etc/net/ifaces/ens1/options
-TYPE=eth
-DISABLED=no
-NM_CONTROLLED=no
-EOF
-        echo "172.16.1.1/28" > /etc/net/ifaces/ens1/ipv4address
+        mkdir -p /etc/net/ifaces/ens2 /etc/net/ifaces/ens3
 
         cat << 'EOF' > /etc/net/ifaces/ens2/options
 TYPE=eth
 DISABLED=no
 NM_CONTROLLED=no
 EOF
-        echo "172.16.2.1/28" > /etc/net/ifaces/ens2/ipv4address
+        echo "172.16.1.1/28" > /etc/net/ifaces/ens2/ipv4address
+
+        cat << 'EOF' > /etc/net/ifaces/ens3/options
+TYPE=eth
+DISABLED=no
+NM_CONTROLLED=no
+EOF
+        echo "172.16.2.1/28" > /etc/net/ifaces/ens3/ipv4address
 
         sysctl -w net.ipv4.ip_forward=1
         iptables -F
         iptables -t nat -F
-        iptables -t nat -A POSTROUTING -o ens0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ens3 -j MASQUERADE
+        iptables -t nat -A POSTROUTING -o ens1 -j MASQUERADE
         iptables-save > /etc/sysconfig/iptables
         systemctl enable --now iptables
         systemctl restart network
@@ -64,21 +62,26 @@ EOF
         echo "net_admin:$PASS" | chpasswd
         echo "net_admin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/net_admin
 
-        # HQ-RTR: ens0 (WAN), ens1 (LAN/VLAN)
-        mkdir -p /etc/net/ifaces/ens0 /etc/net/ifaces/ens1
-        echo "172.16.1.2/28" > /etc/net/ifaces/ens0/ipv4address
-        echo "default via 172.16.1.1" > /etc/net/ifaces/ens0/ipv4route
+        mkdir -p /etc/net/ifaces/ens1 /etc/net/ifaces/ens2
+        echo "172.16.1.2/28" > /etc/net/ifaces/ens1/ipv4address
+        echo "default via 172.16.1.1" > /etc/net/ifaces/ens1/ipv4route
+
+        cat << 'EOF' > /etc/net/ifaces/ens2/options
+TYPE=eth
+DISABLED=no
+NM_CONTROLLED=no
+EOF
 
         for vlan in 100 200 999; do
-            mkdir -p /etc/net/ifaces/ens1.$vlan
-            echo -e "TYPE=vlan\nVLAN_DEV=ens1" > /etc/net/ifaces/ens1.$vlan/options
+            mkdir -p /etc/net/ifaces/ens2.$vlan
+            echo -e "TYPE=vlan\nVLAN_DEV=ens2" > /etc/net/ifaces/ens2.$vlan/options
         done
-        echo "192.168.100.1/27" > /etc/net/ifaces/ens1.100/ipv4address
-        echo "192.168.200.1/28" > /etc/net/ifaces/ens1.200/ipv4address
-        echo "192.168.99.1/29" > /etc/net/ifaces/ens1.999/ipv4address
+        echo "192.168.100.1/27" > /etc/net/ifaces/ens2.100/ipv4address
+        echo "192.168.200.1/28" > /etc/net/ifaces/ens2.200/ipv4address
+        echo "192.168.99.1/29" > /etc/net/ifaces/ens2.999/ipv4address
 
         sysctl -w net.ipv4.ip_forward=1
-        iptables -t nat -A POSTROUTING -o ens0 -j MASQUERADE
+        iptables -t nat -A POSTROUTING -o ens1 -j MASQUERADE
         iptables-save > /etc/sysconfig/iptables
 
         ip tunnel add gre1 mode gre remote 172.16.2.2 local 172.16.1.2 ttl 255 || true
@@ -87,7 +90,7 @@ EOF
 
         apt-get update && apt-get install -y dnsmasq frr
         cat << 'EOF' > /etc/dnsmasq.d/dhcp-hq.conf
-interface=ens1.200
+interface=ens2.200
 dhcp-range=192.168.200.2,192.168.200.14,255.255.255.240,12h
 dhcp-option=option:router,192.168.200.1
 dhcp-option=option:dns-server,192.168.100.10
@@ -117,9 +120,9 @@ EOF
     3)
         echo "[+] Configuring HQ-SRV..."
         hostnamectl set-hostname hq-srv.au-team.irpo
-        mkdir -p /etc/net/ifaces/ens0
-        echo "192.168.100.10/27" > /etc/net/ifaces/ens0/ipv4address
-        echo "default via 192.168.100.1" > /etc/net/ifaces/ens0/ipv4route
+        mkdir -p /etc/net/ifaces/ens1
+        echo "192.168.100.10/27" > /etc/net/ifaces/ens1/ipv4address
+        echo "default via 192.168.100.1" > /etc/net/ifaces/ens1/ipv4route
 
         useradd -u 2027 -m -s /bin/bash sshuser || true
         echo "sshuser:$PASS" | chpasswd
@@ -183,8 +186,8 @@ EOF
     4)
         echo "[+] Configuring HQ-CLI..."
         hostnamectl set-hostname hq-cli.au-team.irpo
-        mkdir -p /etc/net/ifaces/ens0
-        cat << 'EOF' > /etc/net/ifaces/ens0/options
+        mkdir -p /etc/net/ifaces/ens1
+        cat << 'EOF' > /etc/net/ifaces/ens1/options
 TYPE=eth
 BOOTPROTO=dhcp
 DISABLED=no
@@ -200,14 +203,13 @@ EOF
         echo "net_admin:$PASS" | chpasswd
         echo "net_admin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/net_admin
 
-        # BR-RTR: ens0 (WAN), ens1 (LAN to BR-FW)
-        mkdir -p /etc/net/ifaces/ens0 /etc/net/ifaces/ens1
-        echo "172.16.2.2/28" > /etc/net/ifaces/ens0/ipv4address
-        echo "default via 172.16.2.1" > /etc/net/ifaces/ens0/ipv4route
-        echo "10.20.0.1/30" > /etc/net/ifaces/ens1/ipv4address
+        mkdir -p /etc/net/ifaces/ens1 /etc/net/ifaces/ens2
+        echo "172.16.2.2/28" > /etc/net/ifaces/ens1/ipv4address
+        echo "default via 172.16.2.1" > /etc/net/ifaces/ens1/ipv4route
+        echo "10.20.0.1/30" > /etc/net/ifaces/ens2/ipv4address
 
         sysctl -w net.ipv4.ip_forward=1
-        iptables -t nat -A POSTROUTING -o ens0 -j MASQUERADE
+        iptables -t nat -A POSTROUTING -o ens1 -j MASQUERADE
         iptables-save > /etc/sysconfig/iptables
 
         ip tunnel add gre1 mode gre remote 172.16.1.2 local 172.16.2.2 ttl 255 || true
@@ -236,7 +238,6 @@ EOF
     6)
         echo "[+] Configuring BR-FW..."
         hostnamectl set-hostname br-fw.au-team.irpo
-        # ОСТАВЛЯЕМ eth0, eth1 ДЛЯ BR-FW
         mkdir -p /etc/net/ifaces/eth0 /etc/net/ifaces/eth1
         echo "10.20.0.2/30" > /etc/net/ifaces/eth0/ipv4address
         echo "default via 10.20.0.1" > /etc/net/ifaces/eth0/ipv4route
@@ -263,9 +264,9 @@ EOF
     7)
         echo "[+] Configuring BR-SRV..."
         hostnamectl set-hostname br-srv.au-team.irpo
-        mkdir -p /etc/net/ifaces/ens0
-        echo "10.20.1.10/28" > /etc/net/ifaces/ens0/ipv4address
-        echo "default via 10.20.1.1" > /etc/net/ifaces/ens0/ipv4route
+        mkdir -p /etc/net/ifaces/ens3
+        echo "10.20.1.10/28" > /etc/net/ifaces/ens3/ipv4address
+        echo "default via 10.20.1.1" > /etc/net/ifaces/ens3/ipv4route
 
         useradd -u 2027 -m -s /bin/bash sshuser || true
         echo "sshuser:$PASS" | chpasswd
