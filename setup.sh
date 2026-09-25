@@ -1,9 +1,6 @@
 #!/bin/bash
 # --- DEMO EXAM AUTOMATED SETUP SCRIPT ---
 
-# Auto-fix Windows CRLF to Linux LF
-sed -i 's/\r$//' "$0" 2>/dev/null || true
-
 set -e
 
 # Global variables
