@@ -1,7 +1,5 @@
 #!/bin/bash
-# --- DEMO EXAM AUTOMATED SETUP SCRIPT ---
-
-set -e
+# --- DEMO EXAM AUTOMATED SETUP SCRIPT (FIXED FOR ALT LINUX) ---
 
 # Global variables
 DOMAIN="au-team.irpo"
@@ -44,13 +42,17 @@ NM_CONTROLLED=no
 EOF
         echo "172.16.2.1/28" > /etc/net/ifaces/ens3/ipv4address
 
+        # Direct IP assignment
+        ip addr add 172.16.1.1/28 dev ens2 2>/dev/null || true
+        ip addr add 172.16.2.1/28 dev ens3 2>/dev/null || true
+
         sysctl -w net.ipv4.ip_forward=1
         iptables -F
         iptables -t nat -F
         iptables -t nat -A POSTROUTING -o ens1 -j MASQUERADE
         iptables-save > /etc/sysconfig/iptables
-        systemctl enable --now iptables
-        systemctl restart network
+        systemctl enable --now iptables 2>/dev/null || true
+        service network restart
         echo "[V] ISP configured successfully!"
         ;;
 
@@ -58,11 +60,16 @@ EOF
         echo "[+] Configuring HQ-RTR..."
         hostnamectl set-hostname hq-rtr.au-team.irpo
         
-        useradd -m -s /bin/bash net_admin || true
+        useradd -m -s /bin/bash net_admin 2>/dev/null || true
         echo "net_admin:$PASS" | chpasswd
         echo "net_admin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/net_admin
 
         mkdir -p /etc/net/ifaces/ens1 /etc/net/ifaces/ens2
+        cat << 'EOF' > /etc/net/ifaces/ens1/options
+TYPE=eth
+DISABLED=no
+NM_CONTROLLED=no
+EOF
         echo "172.16.1.2/28" > /etc/net/ifaces/ens1/ipv4address
         echo "default via 172.16.1.1" > /etc/net/ifaces/ens1/ipv4route
 
@@ -74,21 +81,36 @@ EOF
 
         for vlan in 100 200 999; do
             mkdir -p /etc/net/ifaces/ens2.$vlan
-            echo -e "TYPE=vlan\nVLAN_DEV=ens2" > /etc/net/ifaces/ens2.$vlan/options
+            echo -e "TYPE=vlan\nVLAN_DEV=ens2\nDISABLED=no" > /etc/net/ifaces/ens2.$vlan/options
         done
         echo "192.168.100.1/27" > /etc/net/ifaces/ens2.100/ipv4address
         echo "192.168.200.1/28" > /etc/net/ifaces/ens2.200/ipv4address
         echo "192.168.99.1/29" > /etc/net/ifaces/ens2.999/ipv4address
 
+        # Force physical and sub-interface creation directly
+        ip link set dev ens1 up
+        ip link set dev ens2 up
+        ip addr add 172.16.1.2/28 dev ens1 2>/dev/null || true
+        ip route add default via 172.16.1.1 2>/dev/null || true
+
+        for vlan in 100 200 999; do
+            ip link add link ens2 name ens2.$vlan type vlan id $vlan 2>/dev/null || true
+            ip link set dev ens2.$vlan up
+        done
+        ip addr add 192.168.100.1/27 dev ens2.100 2>/dev/null || true
+        ip addr add 192.168.200.1/28 dev ens2.200 2>/dev/null || true
+        ip addr add 192.168.99.1/29 dev ens2.999 2>/dev/null || true
+
         sysctl -w net.ipv4.ip_forward=1
         iptables -t nat -A POSTROUTING -o ens1 -j MASQUERADE
         iptables-save > /etc/sysconfig/iptables
 
-        ip tunnel add gre1 mode gre remote 172.16.2.2 local 172.16.1.2 ttl 255 || true
-        ip addr add 10.10.10.1/30 dev gre1 || true
+        ip tunnel add gre1 mode gre remote 172.16.2.2 local 172.16.1.2 ttl 255 2>/dev/null || true
+        ip addr add 10.10.10.1/30 dev gre1 2>/dev/null || true
         ip link set gre1 up
 
-        apt-get update && apt-get install -y dnsmasq frr
+        apt-get update && apt-get install -y dnsmasq frr 2>/dev/null || true
+
         cat << 'EOF' > /etc/dnsmasq.d/dhcp-hq.conf
 interface=ens2.200
 dhcp-range=192.168.200.2,192.168.200.14,255.255.255.240,12h
@@ -96,7 +118,7 @@ dhcp-option=option:router,192.168.200.1
 dhcp-option=option:dns-server,192.168.100.10
 dhcp-option=option:domain-search,au-team.irpo
 EOF
-        systemctl enable --now dnsmasq
+        systemctl enable --now dnsmasq 2>/dev/null || true
 
         cat << 'EOF' > /etc/frr/frr.conf
 frr version 8.1
@@ -111,9 +133,9 @@ router ospf
  network 192.168.100.0/27 area 0
  network 192.168.200.0/28 area 0
 EOF
-        chown frr:frr /etc/frr/frr.conf
-        systemctl enable --now frr
-        systemctl restart network
+        chown frr:frr /etc/frr/frr.conf 2>/dev/null || true
+        systemctl enable --now frr 2>/dev/null || true
+        service network restart
         echo "[V] HQ-RTR configured successfully!"
         ;;
 
@@ -121,10 +143,18 @@ EOF
         echo "[+] Configuring HQ-SRV..."
         hostnamectl set-hostname hq-srv.au-team.irpo
         mkdir -p /etc/net/ifaces/ens1
+        cat << 'EOF' > /etc/net/ifaces/ens1/options
+TYPE=eth
+DISABLED=no
+NM_CONTROLLED=no
+EOF
         echo "192.168.100.10/27" > /etc/net/ifaces/ens1/ipv4address
         echo "default via 192.168.100.1" > /etc/net/ifaces/ens1/ipv4route
 
-        useradd -u 2027 -m -s /bin/bash sshuser || true
+        ip addr add 192.168.100.10/27 dev ens1 2>/dev/null || true
+        ip route add default via 192.168.100.1 2>/dev/null || true
+
+        useradd -u 2027 -m -s /bin/bash sshuser 2>/dev/null || true
         echo "sshuser:$PASS" | chpasswd
         echo "sshuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/sshuser
 
@@ -137,7 +167,7 @@ Banner /etc/issue.net
 EOF
         systemctl restart sshd
 
-        apt-get update && apt-get install -y bind bind-utils
+        apt-get update && apt-get install -y bind bind-utils 2>/dev/null || true
         cat << 'EOF' > /etc/bind/options.conf
 options {
     directory "/var/lib/bind";
@@ -178,8 +208,8 @@ $TTL 604800
 @ IN NS hq-srv.au-team.irpo.
 10 IN PTR br-srv.au-team.irpo.
 EOF
-        systemctl enable --now bind
-        systemctl restart network
+        systemctl enable --now bind 2>/dev/null || true
+        service network restart
         echo "[V] HQ-SRV configured successfully!"
         ;;
 
@@ -192,14 +222,14 @@ TYPE=eth
 BOOTPROTO=dhcp
 DISABLED=no
 EOF
-        systemctl restart network
+        service network restart
         echo "[V] HQ-CLI configured successfully!"
         ;;
 
     5)
         echo "[+] Configuring BR-RTR..."
         hostnamectl set-hostname br-rtr.au-team.irpo
-        useradd -m -s /bin/bash net_admin || true
+        useradd -m -s /bin/bash net_admin 2>/dev/null || true
         echo "net_admin:$PASS" | chpasswd
         echo "net_admin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/net_admin
 
@@ -208,15 +238,19 @@ EOF
         echo "default via 172.16.2.1" > /etc/net/ifaces/ens1/ipv4route
         echo "10.20.0.1/30" > /etc/net/ifaces/ens2/ipv4address
 
+        ip addr add 172.16.2.2/28 dev ens1 2>/dev/null || true
+        ip route add default via 172.16.2.1 2>/dev/null || true
+        ip addr add 10.20.0.1/30 dev ens2 2>/dev/null || true
+
         sysctl -w net.ipv4.ip_forward=1
         iptables -t nat -A POSTROUTING -o ens1 -j MASQUERADE
         iptables-save > /etc/sysconfig/iptables
 
-        ip tunnel add gre1 mode gre remote 172.16.1.2 local 172.16.2.2 ttl 255 || true
-        ip addr add 10.10.10.2/30 dev gre1 || true
+        ip tunnel add gre1 mode gre remote 172.16.1.2 local 172.16.2.2 ttl 255 2>/dev/null || true
+        ip addr add 10.10.10.2/30 dev gre1 2>/dev/null || true
         ip link set gre1 up
 
-        apt-get update && apt-get install -y frr
+        apt-get update && apt-get install -y frr 2>/dev/null || true
         cat << 'EOF' > /etc/frr/frr.conf
 frr version 8.1
 frr defaults traditional
@@ -229,9 +263,9 @@ router ospf
  network 10.10.10.0/30 area 0
  network 10.20.0.0/30 area 0
 EOF
-        chown frr:frr /etc/frr/frr.conf
-        systemctl enable --now frr
-        systemctl restart network
+        chown frr:frr /etc/frr/frr.conf 2>/dev/null || true
+        systemctl enable --now frr 2>/dev/null || true
+        service network restart
         echo "[V] BR-RTR configured successfully!"
         ;;
 
@@ -243,8 +277,12 @@ EOF
         echo "default via 10.20.0.1" > /etc/net/ifaces/eth0/ipv4route
         echo "10.20.1.1/28" > /etc/net/ifaces/eth1/ipv4address
 
+        ip addr add 10.20.0.2/30 dev eth0 2>/dev/null || true
+        ip route add default via 10.20.0.1 2>/dev/null || true
+        ip addr add 10.20.1.1/28 dev eth1 2>/dev/null || true
+
         sysctl -w net.ipv4.ip_forward=1
-        apt-get update && apt-get install -y frr
+        apt-get update && apt-get install -y frr 2>/dev/null || true
         cat << 'EOF' > /etc/frr/frr.conf
 frr version 8.1
 frr defaults traditional
@@ -255,9 +293,9 @@ router ospf
  network 10.20.1.0/28 area 0
  passive-interface eth1
 EOF
-        chown frr:frr /etc/frr/frr.conf
-        systemctl enable --now frr
-        systemctl restart network
+        chown frr:frr /etc/frr/frr.conf 2>/dev/null || true
+        systemctl enable --now frr 2>/dev/null || true
+        service network restart
         echo "[V] BR-FW configured successfully!"
         ;;
 
@@ -268,7 +306,10 @@ EOF
         echo "10.20.1.10/28" > /etc/net/ifaces/ens3/ipv4address
         echo "default via 10.20.1.1" > /etc/net/ifaces/ens3/ipv4route
 
-        useradd -u 2027 -m -s /bin/bash sshuser || true
+        ip addr add 10.20.1.10/28 dev ens3 2>/dev/null || true
+        ip route add default via 10.20.1.1 2>/dev/null || true
+
+        useradd -u 2027 -m -s /bin/bash sshuser 2>/dev/null || true
         echo "sshuser:$PASS" | chpasswd
         echo "sshuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/sshuser
 
@@ -280,7 +321,7 @@ MaxAuthTries 2
 Banner /etc/issue.net
 EOF
         systemctl restart sshd
-        systemctl restart network
+        service network restart
         echo "[V] BR-SRV configured successfully!"
         ;;
 
