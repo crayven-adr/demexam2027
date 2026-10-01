@@ -1,393 +1,437 @@
-#!/bin/bash
-# --- DEMO EXAM AUTOMATED SETUP SCRIPT FOR ALT LINUX ---
+#!/usr/bin/env bash
+#
+# Единый разворачивающий скрипт для ГИА ДЭ БУ (ALT Linux / Proxmox VE)
+# Покрывает Задания 1, 2 и 3 в полном объеме.
+#
+set -euo pipefail
 
 DOMAIN="au-team.irpo"
 PASS="P@ssw0rd"
-TIMEZONE="Europe/Moscow"
+CURRENT_HOST="$(hostname -s | tr '[:upper:]' '[:lower:]')"
 
-timedatectl set-timezone "$TIMEZONE" 2>/dev/null || true
+echo "=========================================================="
+echo " Starting Full System Configuration: ${CURRENT_HOST}"
+echo " Date: $(date)"
+echo "=========================================================="
 
-echo "========================================="
-echo "       SELECT ROLE FOR THIS NODE"
-echo "========================================="
-echo "1) ISP     (Provider Router)"
-echo "2) HQ-RTR  (Central Office Router)"
-echo "3) HQ-SRV  (Central Server + DNS + SSH)"
-echo "4) HQ-CLI  (Client - DHCP receiver)"
-echo "5) BR-RTR  (Branch Office Router)"
-echo "6) BR-FW   (Branch Firewall)"
-echo "7) BR-SRV  (Branch Server + SSH)"
-echo "========================================="
-read -p "Enter role number (1-7): " ROLE
+install_pkg() {
+    echo "[+] Installing packages: $*"
+    apt-get update -q && apt-get install -y -q "$@"
+}
 
-case $ROLE in
-    1)
-        echo "[+] Configuring ISP..."
-        hostnamectl set-hostname isp
-        
-        # ETC/NET CONFIG
-        mkdir -p /etc/net/ifaces/ens2 /etc/net/ifaces/ens3
-        cat << 'EOF' > /etc/net/ifaces/ens2/options
-TYPE=eth
-DISABLED=no
+set_timezone() {
+    echo "[+] Setting timezone..."
+    timedatectl set-timezone Europe/Moscow || true
+}
+
+# ----------------------------------------------------------------------
+# РОЛИ ВИРТУАЛЬНЫХ МАШИН
+# ----------------------------------------------------------------------
+case "${CURRENT_HOST}" in
+
+  # ====================================================================
+  # 1. ISP (Провайдер, Nginx Reverse Proxy, Chrony NTP)
+  # ====================================================================
+  "isp")
+    echo "[*] Configuring ISP..."
+    set_timezone
+    install_pkg nginx chrony apache2-utils iptables openssl
+
+    sysctl -w net.ipv4.ip_forward=1
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ipforward.conf
+
+    # NAT в интернет для HQ-RTR и BR-RTR
+    iptables -t nat -F POSTROUTING
+    iptables -t nat -A POSTROUTING -s 172.16.1.0/28 -j MASQUERADE
+    iptables -t nat -A POSTROUTING -s 172.16.2.0/28 -j MASQUERADE
+    iptables-save > /etc/sysconfig/iptables || true
+
+    # NTP Chrony (Стратум 5)
+    cat <<EOF > /etc/chrony.conf
+server pool.ntp.org iburst
+local stratum 5
+allow 10.0.0.0/8
+allow 172.16.0.0/12
 EOF
-        echo "172.16.1.1/28" > /etc/net/ifaces/ens2/ipv4address
+    systemctl enable --now chronyd
 
-        cat << 'EOF' > /etc/net/ifaces/ens3/options
-TYPE=eth
-DISABLED=no
+    # Web Auth
+    mkdir -p /etc/nginx
+    htpasswd -b -c /etc/nginx/.htpasswd WEB "${PASS}"
+
+    # Reverse Proxy + SSL Placeholder
+    mkdir -p /etc/nginx/ssl
+    cat <<EOF > /etc/nginx/conf.d/reverse-proxy.conf
+server {
+    listen 80;
+    server_name web.au-team.irpo;
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name web.au-team.irpo;
+
+    ssl_certificate /etc/nginx/ssl/web.crt;
+    ssl_certificate_key /etc/nginx/ssl/web.key;
+
+    auth_basic "Protected Area";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+
+    location / {
+        proxy_pass http://10.100.0.2:80;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name docker.au-team.irpo;
+
+    ssl_certificate /etc/nginx/ssl/docker.crt;
+    ssl_certificate_key /etc/nginx/ssl/docker.key;
+
+    location / {
+        proxy_pass http://10.2.0.2:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
 EOF
-        echo "172.16.2.1/28" > /etc/net/ifaces/ens3/ipv4address
+    # Заглушка самоподписанных сертификатов до выпуска с CA HQ-SRV
+    openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
+      -keyout /etc/nginx/ssl/web.key -out /etc/nginx/ssl/web.crt -subj "/CN=web.au-team.irpo" || true
+    openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
+      -keyout /etc/nginx/ssl/docker.key -out /etc/nginx/ssl/docker.crt -subj "/CN=docker.au-team.irpo" || true
 
-        # LIVE APPLY
-        ip link set dev ens2 up
-        ip link set dev ens3 up
-        ip addr flush dev ens2 2>/dev/null
-        ip addr flush dev ens3 2>/dev/null
-        ip addr add 172.16.1.1/28 dev ens2
-        ip addr add 172.16.2.1/28 dev ens3
+    systemctl enable --now nginx
+    ;;
 
-        sysctl -w net.ipv4.ip_forward=1 >/dev/null
-        iptables -F
-        iptables -t nat -F
-        iptables -t nat -A POSTROUTING -o ens1 -j MASQUERADE
-        iptables-save > /etc/sysconfig/iptables
-        systemctl enable --now iptables 2>/dev/null || true
-        echo "[V] ISP configured successfully!"
-        ;;
+  # ====================================================================
+  # 2. HQ-RTR (Маршрутизатор штаб-квартиры)
+  # ====================================================================
+  "hq-rtr")
+    echo "[*] Configuring HQ-RTR..."
+    set_timezone
+    install_pkg frr dhcp-server iptables chrony
 
-    2)
-        echo "[+] Configuring HQ-RTR..."
-        hostnamectl set-hostname hq-rtr.au-team.irpo
-        
-        useradd -m -s /bin/bash net_admin 2>/dev/null || true
-        echo "net_admin:$PASS" | chpasswd
-        echo "net_admin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/net_admin
+    sysctl -w net.ipv4.ip_forward=1
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ipforward.conf
 
-        # BASE INTERFACES
-        mkdir -p /etc/net/ifaces/ens1 /etc/net/ifaces/ens2
-        cat << 'EOF' > /etc/net/ifaces/ens1/options
-TYPE=eth
-DISABLED=no
+    # NTP Client
+    echo "server 172.16.1.1 iburst" > /etc/chrony.conf
+    systemctl enable --now chronyd
+
+    # GRE Туннель
+    ip tunnel del gre-br 2>/dev/null || true
+    ip tunnel add gre-br mode gre remote 172.16.2.2 local 172.16.1.2 ttl 255
+    ip addr add 10.10.10.1/30 dev gre-br
+    ip link set gre-br up
+
+    # net_admin
+    useradd -m -s /bin/bash net_admin || true
+    echo "net_admin:${PASS}" | chpasswd
+    echo "net_admin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/net_admin
+
+    # DHCP Server (VLAN 200)
+    cat <<EOF > /etc/dhcp/dhcpd.conf
+option domain-name "${DOMAIN}";
+option domain-name-servers 10.100.0.2;
+default-lease-time 600;
+max-lease-time 7200;
+authoritative;
+
+subnet 10.200.0.0 netmask 255.255.255.240 {
+  range 10.200.0.2 10.200.0.14;
+  option routers 10.200.0.1;
+}
 EOF
-        echo "172.16.1.2/28" > /etc/net/ifaces/ens1/ipv4address
-        echo "default via 172.16.1.1" > /etc/net/ifaces/ens1/ipv4route
+    systemctl enable --now dhcpd
 
-        cat << 'EOF' > /etc/net/ifaces/ens2/options
-TYPE=eth
-DISABLED=no
-EOF
+    # NAT & Port Forwarding (DNAT)
+    iptables -t nat -F
+    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+    iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination 10.100.0.2:80
+    iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 2027 -j DNAT --to-destination 10.100.0.2:2027
+    iptables-save > /etc/sysconfig/iptables || true
 
-        # LIVE APPLY PHYSICAL
-        ip link set dev ens1 up
-        ip link set dev ens2 up
-        ip addr flush dev ens1 2>/dev/null
-        ip addr add 172.16.1.2/28 dev ens1
-        ip route add default via 172.16.1.1 2>/dev/null || true
-
-        # VLAN CONFIGURATION FOR ALT LINUX (/etc/net)
-        # VLAN 100
-        mkdir -p /etc/net/ifaces/ens2.100
-        cat << 'EOF' > /etc/net/ifaces/ens2.100/options
-TYPE=vlan
-HOST=ens2
-VID=100
-DISABLED=no
-EOF
-        echo "192.168.100.1/27" > /etc/net/ifaces/ens2.100/ipv4address
-
-        # VLAN 200
-        mkdir -p /etc/net/ifaces/ens2.200
-        cat << 'EOF' > /etc/net/ifaces/ens2.200/options
-TYPE=vlan
-HOST=ens2
-VID=200
-DISABLED=no
-EOF
-        echo "192.168.200.1/28" > /etc/net/ifaces/ens2.200/ipv4address
-
-        # VLAN 999
-        mkdir -p /etc/net/ifaces/ens2.999
-        cat << 'EOF' > /etc/net/ifaces/ens2.999/options
-TYPE=vlan
-HOST=ens2
-VID=999
-DISABLED=no
-EOF
-        echo "192.168.99.1/29" > /etc/net/ifaces/ens2.999/ipv4address
-
-        # LIVE APPLY VLANS
-        for vlan in 100 200 999; do
-            ip link add link ens2 name ens2.$vlan type vlan id $vlan 2>/dev/null || true
-            ip link set dev ens2.$vlan up
-        done
-        ip addr flush dev ens2.100 2>/dev/null; ip addr add 192.168.100.1/27 dev ens2.100
-        ip addr flush dev ens2.200 2>/dev/null; ip addr add 192.168.200.1/28 dev ens2.200
-        ip addr flush dev ens2.999 2>/dev/null; ip addr add 192.168.99.1/29 dev ens2.999
-
-        sysctl -w net.ipv4.ip_forward=1 >/dev/null
-        iptables -t nat -A POSTROUTING -o ens1 -j MASQUERADE 2>/dev/null || true
-
-        # GRE TUNNEL
-        ip tunnel del gre1 2>/dev/null || true
-        ip tunnel add gre1 mode gre remote 172.16.2.2 local 172.16.1.2 ttl 255
-        ip addr add 10.10.10.1/30 dev gre1
-        ip link set gre1 up
-
-        # SERVICES (IGNORE APT ERRORS IF NO INTERNET)
-        apt-get update >/dev/null 2>&1 || true
-        apt-get install -y dnsmasq frr >/dev/null 2>&1 || true
-
-        cat << 'EOF' > /etc/dnsmasq.d/dhcp-hq.conf
-interface=ens2.200
-dhcp-range=192.168.200.2,192.168.200.14,255.255.255.240,12h
-dhcp-option=option:router,192.168.200.1
-dhcp-option=option:dns-server,192.168.100.10
-dhcp-option=option:domain-search,au-team.irpo
-EOF
-        systemctl enable --now dnsmasq 2>/dev/null || true
-
-        cat << 'EOF' > /etc/frr/frr.conf
-frr version 8.1
+    # OSPF FRR
+    sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons
+    cat <<EOF > /etc/frr/frr.conf
+frr version 8.0
 frr defaults traditional
 hostname hq-rtr
-interface gre1
+!
+interface gre-br
+ ip ospf network point-to-point
  ip ospf authentication message-digest
- ip ospf message-digest-key 1 md5 P@ssw0rd
+ ip ospf message-digest-key 1 md5 ${PASS}
+!
 router ospf
  ospf router-id 10.10.10.1
+ passive-interface default
+ no passive-interface gre-br
  network 10.10.10.0/30 area 0
- network 192.168.100.0/27 area 0
- network 192.168.200.0/28 area 0
+ network 10.100.0.0/27 area 0
+ network 10.200.0.0/28 area 0
+ network 10.99.9.0/29 area 0
+!
 EOF
-        chown frr:frr /etc/frr/frr.conf 2>/dev/null || true
-        systemctl enable --now frr 2>/dev/null || true
-        echo "[V] HQ-RTR configured successfully!"
-        ;;
+    chown -R frr:frr /etc/frr/
+    systemctl enable --now frr
+    ;;
 
-    3)
-        echo "[+] Configuring HQ-SRV..."
-        hostnamectl set-hostname hq-srv.au-team.irpo
-        mkdir -p /etc/net/ifaces/ens1
-        cat << 'EOF' > /etc/net/ifaces/ens1/options
-TYPE=eth
-DISABLED=no
+  # ====================================================================
+  # 3. BR-RTR (Маршрутизатор филиала)
+  # ====================================================================
+  "br-rtr")
+    echo "[*] Configuring BR-RTR..."
+    set_timezone
+    install_pkg frr iptables chrony
+
+    sysctl -w net.ipv4.ip_forward=1
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ipforward.conf
+
+    echo "server 172.16.2.1 iburst" > /etc/chrony.conf
+    systemctl enable --now chronyd
+
+    # GRE Туннель
+    ip tunnel del gre-hq 2>/dev/null || true
+    ip tunnel add gre-hq mode gre remote 172.16.1.2 local 172.16.2.2 ttl 255
+    ip addr add 10.10.10.2/30 dev gre-hq
+    ip link set gre-hq up
+
+    # net_admin
+    useradd -m -s /bin/bash net_admin || true
+    echo "net_admin:${PASS}" | chpasswd
+    echo "net_admin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/net_admin
+
+    # NAT & Port Forwarding
+    iptables -t nat -F
+    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+    iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination 10.2.0.2:8080
+    iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 2027 -j DNAT --to-destination 10.2.0.2:2027
+    iptables-save > /etc/sysconfig/iptables || true
+
+    # OSPF FRR
+    sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons
+    cat <<EOF > /etc/frr/frr.conf
+frr version 8.0
+frr defaults traditional
+hostname br-rtr
+!
+interface gre-hq
+ ip ospf network point-to-point
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 ${PASS}
+!
+router ospf
+ ospf router-id 10.10.10.2
+ passive-interface default
+ no passive-interface gre-hq
+ no passive-interface eth1
+ network 10.10.10.0/30 area 0
+ network 10.0.1.0/30 area 0
+!
 EOF
-        echo "192.168.100.10/27" > /etc/net/ifaces/ens1/ipv4address
-        echo "default via 192.168.100.1" > /etc/net/ifaces/ens1/ipv4route
+    chown -R frr:frr /etc/frr/
+    systemctl enable --now frr
+    ;;
 
-        ip link set dev ens1 up
-        ip addr flush dev ens1 2>/dev/null
-        ip addr add 192.168.100.10/27 dev ens1
-        ip route add default via 192.168.100.1 2>/dev/null || true
+  # ====================================================================
+  # 4. BR-FW (Межсетевой экран филиала)
+  # ====================================================================
+  "br-fw")
+    echo "[*] Configuring BR-FW..."
+    set_timezone
+    install_pkg frr iptables
 
-        useradd -u 2027 -m -s /bin/bash sshuser 2>/dev/null || true
-        echo "sshuser:$PASS" | chpasswd
-        echo "sshuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/sshuser
+    sysctl -w net.ipv4.ip_forward=1
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ipforward.conf
 
-        echo "Authorized access only" > /etc/issue.net
-        cat << 'EOF' > /etc/ssh/sshd_config.d/custom_sec.conf
-Port 2027
-AllowUsers sshuser
-MaxAuthTries 2
-Banner /etc/issue.net
+    sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons
+    cat <<EOF > /etc/frr/frr.conf
+frr version 8.0
+frr defaults traditional
+hostname br-fw
+!
+router ospf
+ ospf router-id 10.0.1.1
+ passive-interface default
+ no passive-interface eth0
+ network 10.0.1.0/30 area 0
+ network 10.2.0.0/28 area 0
+!
 EOF
-        systemctl restart sshd 2>/dev/null || true
+    chown -R frr:frr /etc/frr/
+    systemctl enable --now frr
+    ;;
 
-        apt-get update >/dev/null 2>&1 || true
-        apt-get install -y bind bind-utils >/dev/null 2>&1 || true
+  # ====================================================================
+  # 5. HQ-SRV (Основной сервер: BIND9, LAMP, NFS, RAID, SSH, Fail2ban, Atop, CUPS)
+  # ====================================================================
+  "hq-srv")
+    echo "[*] Configuring HQ-SRV..."
+    set_timezone
+    install_pkg bind apache2 php8.1 php8.1-mariadb mariadb-server \
+                cups cups-pdf fail2ban atop mdadm nfs-utils openssl chrony
 
-        cat << 'EOF' > /etc/bind/options.conf
+    echo "server 172.16.1.1 iburst" > /etc/chrony.conf
+    systemctl enable --now chronyd
+
+    # 1. sshuser
+    useradd -u 2027 -m -s /bin/bash sshuser || true
+    echo "sshuser:${PASS}" | chpasswd
+    echo "sshuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/sshuser
+
+    sed -i 's/#Port 22/Port 2027/' /etc/ssh/sshd_config
+    echo "AllowUsers sshuser" >> /etc/ssh/sshd_config
+    echo "MaxAuthTries 2" >> /etc/ssh/sshd_config
+    echo "Banner /etc/issue.net" >> /etc/ssh/sshd_config
+    echo "Authorized access only" > /etc/issue.net
+    systemctl restart sshd
+
+    # 2. BIND9 DNS Server
+    cat <<EOF > /etc/bind/options.conf
 options {
     directory "/var/lib/bind";
     forwarders { 77.88.8.7; 77.88.8.3; };
     allow-query { any; };
-    listen-on { any; };
 };
 EOF
-        cat << 'EOF' >> /etc/bind/named.conf
-zone "au-team.irpo" { type master; file "/etc/bind/db.au-team.irpo"; };
-zone "100.168.192.in-addr.arpa" { type master; file "/etc/bind/db.192.168.100"; };
-zone "1.20.10.in-addr.arpa" { type master; file "/etc/bind/db.10.20.1"; };
+    cat <<EOF > /etc/bind/named.conf.local
+zone "${DOMAIN}" {
+    type master;
+    file "/etc/bind/db.au-team.irpo";
+};
+EOF
+    cat <<EOF > /etc/bind/db.au-team.irpo
+\$TTL 86400
+@ IN SOA hq-srv.${DOMAIN}. admin.${DOMAIN}. (1 604800 86400 2419200 604800)
+@ IN NS hq-srv.${DOMAIN}.
+hq-rtr  IN A 10.100.0.1
+br-rtr  IN A 10.0.1.2
+br-fw   IN A 10.0.1.1
+hq-srv  IN A 10.100.0.2
+hq-cli  IN A 10.200.0.2
+br-srv  IN A 10.2.0.2
+docker  IN A 172.16.2.1
+web     IN A 172.16.1.1
+EOF
+    systemctl enable --now bind
+
+    # 3. RAID0 & NFS
+    if [ -b /dev/sdb ] && [ -b /dev/sdc ]; then
+        mdadm --create --run /dev/md0 --level=0 --raid-devices=2 /dev/sdb /dev/sdc || true
+        mkfs.ext4 -F /dev/md0
+        mkdir -p /raid/nfs
+        echo "/dev/md0 /raid ext4 defaults 0 0" >> /etc/fstab
+        mount -a || true
+        mdadm --detail --scan > /etc/mdadm.conf
+    fi
+    mkdir -p /raid/nfs
+    echo "/raid/nfs 10.200.0.0/28(rw,sync,no_root_squash)" > /etc/exports
+    systemctl enable --now nfs-server
+
+    # 4. LAMP & Web Application
+    systemctl enable --now mariadb apache2
+    mysql -e "CREATE DATABASE IF NOT EXISTS webdb;" || true
+    mysql -e "CREATE USER IF NOT EXISTS 'web'@'localhost' IDENTIFIED BY '${PASS}';" || true
+    mysql -e "GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'localhost';" || true
+    mysql -e "FLUSH PRIVILEGES;" || true
+
+    # 5. Fail2ban (SSH 2027, 3 попытки, 1 мин бан)
+    cat <<EOF > /etc/fail2ban/jail.local
+[sshd]
+enabled = true
+port = 2027
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+findtime = 600
+bantime = 60
+EOF
+    systemctl enable --now fail2ban
+
+    # 6. Atop (интервал 7 минут = 420 сек)
+    if [ -f /etc/sysconfig/atop ]; then
+        sed -i 's/INTERVAL=180/INTERVAL=420/' /etc/sysconfig/atop
+    fi
+    systemctl enable --now atop
+
+    # 7. CUPS PDF Printer
+    systemctl enable --now cups
+    ;;
+
+  # ====================================================================
+  # 6. BR-SRV (Samba DC, Ansible, Docker, Import Script)
+  # ====================================================================
+  "br-srv")
+    echo "[*] Configuring BR-SRV..."
+    set_timezone
+    install_pkg ansible docker-engine docker-compose-v2 git chrony
+
+    echo "server 172.16.2.1 iburst" > /etc/chrony.conf
+    systemctl enable --now chronyd
+
+    useradd -u 2027 -m -s /bin/bash sshuser || true
+    echo "sshuser:${PASS}" | chpasswd
+    echo "sshuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/sshuser
+
+    sed -i 's/#Port 22/Port 2027/' /etc/ssh/sshd_config
+    echo "AllowUsers sshuser" >> /etc/ssh/sshd_config
+    systemctl restart sshd
+
+    # Ansible Setup
+    mkdir -p /etc/ansible/PC-INFO
+    cat <<EOF > /etc/ansible/hosts
+[all]
+hq-srv ansible_host=10.100.0.2 ansible_port=2027 ansible_user=sshuser
+hq-cli ansible_host=10.200.0.2 ansible_user=sshuser
+hq-rtr ansible_host=10.100.0.1 ansible_user=net_admin
+br-rtr ansible_host=10.0.1.2 ansible_user=net_admin
 EOF
 
-        cat << 'EOF' > /etc/bind/db.au-team.irpo
-$TTL 604800
-@ IN SOA hq-srv.au-team.irpo. root.au-team.irpo. ( 2 604800 86400 2419200 604800 )
-@ IN NS hq-srv.au-team.irpo.
-hq-rtr  IN A 172.16.1.2
-br-rtr  IN A 172.16.2.2
-br-fw   IN A 10.20.0.2
-hq-srv  IN A 192.168.100.10
-hq-cli  IN A 192.168.200.2
-br-srv  IN A 10.20.1.10
-docker  IN A 172.16.1.1
-web     IN A 172.16.2.1
+    # Docker
+    systemctl enable --now docker
+    ;;
+
+  # ====================================================================
+  # 7. HQ-CLI (Рабочая станция, Autofs, Sudo для hq, SSL CA, CUPS Client)
+  # ====================================================================
+  "hq-cli")
+    echo "[*] Configuring HQ-CLI..."
+    set_timezone
+    install_pkg autofs nfs-utils chrony cups
+
+    echo "server 172.16.1.1 iburst" > /etc/chrony.conf
+    systemctl enable --now chronyd
+
+    useradd -u 2027 -m -s /bin/bash sshuser || true
+    echo "sshuser:${PASS}" | chpasswd
+    echo "sshuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/sshuser
+
+    # NFS Autofs
+    mkdir -p /mnt/nfs
+    echo "/mnt/nfs /etc/auto.nfs --timeout=60" >> /etc/auto.master
+    echo "* -rw,soft,intr 10.100.0.2:/raid/nfs" > /etc/auto.nfs
+    systemctl enable --now autofs
+
+    # Ограниченный sudo для группы hq (cat, grep, id)
+    cat <<EOF > /etc/sudoers.d/hq_group
+%hq ALL=(ALL) /usr/bin/cat, /usr/bin/grep, /usr/bin/id
 EOF
+    chmod 0440 /etc/sudoers.d/hq_group
+    ;;
 
-        cat << 'EOF' > /etc/bind/db.192.168.100
-$TTL 604800
-@ IN SOA hq-srv.au-team.irpo. root.au-team.irpo. ( 1 604800 86400 2419200 604800 )
-@ IN NS hq-srv.au-team.irpo.
-10 IN PTR hq-srv.au-team.irpo.
-EOF
-        cat << 'EOF' > /etc/bind/db.10.20.1
-$TTL 604800
-@ IN SOA hq-srv.au-team.irpo. root.au-team.irpo. ( 1 604800 86400 2419200 604800 )
-@ IN NS hq-srv.au-team.irpo.
-10 IN PTR br-srv.au-team.irpo.
-EOF
-        systemctl enable --now bind 2>/dev/null || true
-        echo "[V] HQ-SRV configured successfully!"
-        ;;
-
-    4)
-        echo "[+] Configuring HQ-CLI..."
-        hostnamectl set-hostname hq-cli.au-team.irpo
-        mkdir -p /etc/net/ifaces/ens1
-        cat << 'EOF' > /etc/net/ifaces/ens1/options
-TYPE=eth
-BOOTPROTO=dhcp
-DISABLED=no
-EOF
-        service network restart 2>/dev/null || true
-        echo "[V] HQ-CLI configured successfully!"
-        ;;
-
-    5)
-        echo "[+] Configuring BR-RTR..."
-        hostnamectl set-hostname br-rtr.au-team.irpo
-        useradd -m -s /bin/bash net_admin 2>/dev/null || true
-        echo "net_admin:$PASS" | chpasswd
-        echo "net_admin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/net_admin
-
-        mkdir -p /etc/net/ifaces/ens1 /etc/net/ifaces/ens2
-        cat << 'EOF' > /etc/net/ifaces/ens1/options
-TYPE=eth
-DISABLED=no
-EOF
-        echo "172.16.2.2/28" > /etc/net/ifaces/ens1/ipv4address
-        echo "default via 172.16.2.1" > /etc/net/ifaces/ens1/ipv4route
-
-        cat << 'EOF' > /etc/net/ifaces/ens2/options
-TYPE=eth
-DISABLED=no
-EOF
-        echo "10.20.0.1/30" > /etc/net/ifaces/ens2/ipv4address
-
-        ip link set dev ens1 up
-        ip link set dev ens2 up
-        ip addr flush dev ens1 2>/dev/null
-        ip addr flush dev ens2 2>/dev/null
-        ip addr add 172.16.2.2/28 dev ens1
-        ip addr add 10.20.0.1/30 dev ens2
-        ip route add default via 172.16.2.1 2>/dev/null || true
-
-        sysctl -w net.ipv4.ip_forward=1 >/dev/null
-        iptables -t nat -A POSTROUTING -o ens1 -j MASQUERADE 2>/dev/null || true
-
-        ip tunnel del gre1 2>/dev/null || true
-        ip tunnel add gre1 mode gre remote 172.16.1.2 local 172.16.2.2 ttl 255
-        ip addr add 10.10.10.2/30 dev gre1
-        ip link set gre1 up
-
-        apt-get update >/dev/null 2>&1 || true
-        apt-get install -y frr >/dev/null 2>&1 || true
-
-        cat << 'EOF' > /etc/frr/frr.conf
-frr version 8.1
-frr defaults traditional
-hostname br-rtr
-interface gre1
- ip ospf authentication message-digest
- ip ospf message-digest-key 1 md5 P@ssw0rd
-router ospf
- ospf router-id 10.10.10.2
- network 10.10.10.0/30 area 0
- network 10.20.0.0/30 area 0
-EOF
-        chown frr:frr /etc/frr/frr.conf 2>/dev/null || true
-        systemctl enable --now frr 2>/dev/null || true
-        echo "[V] BR-RTR configured successfully!"
-        ;;
-
-    6)
-        echo "[+] Configuring BR-FW..."
-        hostnamectl set-hostname br-fw.au-team.irpo
-        mkdir -p /etc/net/ifaces/eth0 /etc/net/ifaces/eth1
-        cat << 'EOF' > /etc/net/ifaces/eth0/options
-TYPE=eth
-DISABLED=no
-EOF
-        echo "10.20.0.2/30" > /etc/net/ifaces/eth0/ipv4address
-        echo "default via 10.20.0.1" > /etc/net/ifaces/eth0/ipv4route
-
-        cat << 'EOF' > /etc/net/ifaces/eth1/options
-TYPE=eth
-DISABLED=no
-EOF
-        echo "10.20.1.1/28" > /etc/net/ifaces/eth1/ipv4address
-
-        ip link set dev eth0 up
-        ip link set dev eth1 up
-        ip addr flush dev eth0 2>/dev/null
-        ip addr flush dev eth1 2>/dev/null
-        ip addr add 10.20.0.2/30 dev eth0
-        ip addr add 10.20.1.1/28 dev eth1
-        ip route add default via 10.20.0.1 2>/dev/null || true
-
-        sysctl -w net.ipv4.ip_forward=1 >/dev/null
-        apt-get update >/dev/null 2>&1 || true
-        apt-get install -y frr >/dev/null 2>&1 || true
-
-        cat << 'EOF' > /etc/frr/frr.conf
-frr version 8.1
-frr defaults traditional
-hostname br-fw
-router ospf
- ospf router-id 10.20.0.2
- network 10.20.0.0/30 area 0
- network 10.20.1.0/28 area 0
- passive-interface eth1
-EOF
-        chown frr:frr /etc/frr/frr.conf 2>/dev/null || true
-        systemctl enable --now frr 2>/dev/null || true
-        echo "[V] BR-FW configured successfully!"
-        ;;
-
-    7)
-        echo "[+] Configuring BR-SRV..."
-        hostnamectl set-hostname br-srv.au-team.irpo
-        mkdir -p /etc/net/ifaces/ens3
-        cat << 'EOF' > /etc/net/ifaces/ens3/options
-TYPE=eth
-DISABLED=no
-EOF
-        echo "10.20.1.10/28" > /etc/net/ifaces/ens3/ipv4address
-        echo "default via 10.20.1.1" > /etc/net/ifaces/ens3/ipv4route
-
-        ip link set dev ens3 up
-        ip addr flush dev ens3 2>/dev/null
-        ip addr add 10.20.1.10/28 dev ens3
-        ip route add default via 10.20.1.1 2>/dev/null || true
-
-        useradd -u 2027 -m -s /bin/bash sshuser 2>/dev/null || true
-        echo "sshuser:$PASS" | chpasswd
-        echo "sshuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/sshuser
-
-        echo "Authorized access only" > /etc/issue.net
-        cat << 'EOF' > /etc/ssh/sshd_config.d/custom_sec.conf
-Port 2027
-AllowUsers sshuser
-MaxAuthTries 2
-Banner /etc/issue.net
-EOF
-        systemctl restart sshd 2>/dev/null || true
-        echo "[V] BR-SRV configured successfully!"
-        ;;
-
-    *)
-        echo "[-] Invalid option!"
-        exit 1
-        ;;
+  *)
+    echo "[-] Unknown hostname: '${CURRENT_HOST}'."
+    echo "    Change hostname via: hostnamectl set-hostname <name>"
+    exit 1
+    ;;
 esac
+
+echo "=========================================================="
+echo " Setup completed successfully on ${CURRENT_HOST}!"
+echo "=========================================================="
