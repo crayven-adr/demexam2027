@@ -132,6 +132,7 @@ EOF
     # net_admin
     useradd -m -s /bin/bash net_admin || true
     echo "net_admin:${PASS}" | chpasswd
+    mkdir -p /etc/sudoers.d
     echo "net_admin ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/net_admin
 
     # DHCP Server (VLAN 200)
