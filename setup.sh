@@ -108,7 +108,7 @@ EOF
     systemctl enable --now nginx
     ;;
 
-  # ====================================================================
+ # ====================================================================
   # 2. HQ-RTR (Маршрутизатор штаб-квартиры)
   # ====================================================================
   "hq-rtr")
@@ -122,6 +122,29 @@ EOF
     # NTP Client
     echo "server 172.16.1.1 iburst" > /etc/chrony.conf
     systemctl enable --now chronyd
+
+    # ------------------------------------------------------------------
+    # Настройка внутренних интерфейсов / VLAN (на ens2)
+    # ------------------------------------------------------------------
+    ip link set ens2 up
+
+    # VLAN 100 (HQ-SRV)
+    ip link add link ens2 name ens2.100 type vlan id 100 2>/dev/null || true
+    ip addr flush dev ens2.100
+    ip addr add 10.100.0.1/27 dev ens2.100
+    ip link set ens2.100 up
+
+    # VLAN 200 (HQ-CLI)
+    ip link add link ens2 name ens2.200 type vlan id 200 2>/dev/null || true
+    ip addr flush dev ens2.200
+    ip addr add 10.200.0.1/28 dev ens2.200
+    ip link set ens2.200 up
+
+    # VLAN 99 (MGMT)
+    ip link add link ens2 name ens2.99 type vlan id 99 2>/dev/null || true
+    ip addr flush dev ens2.99
+    ip addr add 10.99.9.1/29 dev ens2.99
+    ip link set ens2.99 up
 
     # GRE Туннель
     ip tunnel del gre-br 2>/dev/null || true
@@ -151,9 +174,9 @@ EOF
 
     # NAT & Port Forwarding (DNAT)
     iptables -t nat -F
-    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-    iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination 10.100.0.2:80
-    iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 2027 -j DNAT --to-destination 10.100.0.2:2027
+    iptables -t nat -A POSTROUTING -o ens1 -j MASQUERADE
+    iptables -t nat -A PREROUTING -i ens1 -p tcp --dport 8080 -j DNAT --to-destination 10.100.0.2:80
+    iptables -t nat -A PREROUTING -i ens1 -p tcp --dport 2027 -j DNAT --to-destination 10.100.0.2:2027
     iptables-save > /etc/sysconfig/iptables || true
 
     # OSPF FRR
